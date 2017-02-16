@@ -1,0 +1,531 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+'''
+
+mailctl - Manage mail accounts via api.mailbox.org
+Copyright (c) 2017 Gabriel Klawitter
+
+
+mailctl is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.  This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+todo
+- better handling of the data files
+- umlaute in usernames
+
+'''
+
+__author__  = "Gabriel Klawitter"
+__version__ = "0.1"
+__email__   = "g.klawitter@heinlein-support.de"
+__status__  = "development"
+
+
+
+import jsonrpclib
+import xmlrpclib
+import ssl
+import string
+import random
+
+
+
+MBO_API = 'https://api.mailbox.org/v1/'
+MBO_PLANS = ('MAIL', 'MAILXL', 'MAILXXL', 'Office', 'OfficeXL', 'OfficeXXL')
+
+
+# will be overwritten by command-line arguments
+DEBUG = False
+VERBOSE = False
+
+
+
+
+
+
+def password_generator(self, size=12):
+    '''
+    not that easy to comply to mailbox.org's password policy
+    work in progress
+    '''
+    password_chars = string.ascii_letters + string.digits + '!#$%&()*+-./:=?'
+    password = [random.choice(string.ascii_letters) for _ in range(6)] \
+             + [random.choice(string.digits) for _ in range(2)] \
+             + [random.choice('!#$%&()*+-./:=?') for _ in range(1)] \
+             + [random.choice(password_chars) for _ in range(3)]
+    return ''.join(random.sample(password, len(password)))
+    # return ''.join(random.choice(self.password_chars) for _ in range(size))
+
+
+
+
+class SafeTransport(jsonrpclib.jsonrpc.TransportMixIn, xmlrpclib.SafeTransport):
+    '''
+    http/https transport backend
+    '''
+
+    session = None
+
+    def __init__(self, insecure):
+        '''
+        initialize the https transport according to certification validation 
+        parameter.
+        '''
+        if insecure:
+            context = hasattr(ssl, '_create_unverified_context') \
+                and ssl._create_unverified_context() or None
+            xmlrpclib.SafeTransport.__init__(self, context=context)
+        else:
+            xmlrpclib.SafeTransport.__init__(self)
+
+    def send_content(self, connection, request_body):
+        '''
+        overload TransportMixIn method for http header injection of 
+        API/Session Key
+        
+        '''
+        if self.session:
+            connection.putheader("HPLS-AUTH", self.session)
+            if DEBUG:
+                print("# HPLS-AUTH: %s" % self.session)
+        jsonrpclib.jsonrpc.TransportMixIn.send_content(self, connection, request_body)
+
+
+
+class MBApi(jsonrpclib.Server, object):
+    '''
+    main class to overwrite/add methods of the api
+
+    usually undefined methods here are directly sent to the api
+    '''
+
+    url = MBO_API
+    transport = None
+
+    def __init__(self, username=None, password=None, insecure=False):
+        '''
+        initialize instances with our custom transport for ssl options and 
+        session header.
+        '''
+        self.username = username
+        self.password = password
+
+        self.transport = SafeTransport(insecure)
+
+        super(MBApi, self).__init__(self.url, verbose=DEBUG, 
+                transport=self.transport)
+
+
+
+    def authenticate(self, username, password):
+        '''
+        mailbox api doesn't repect python keywords
+
+        server.auth( user = '', pass = '' )
+        does not work
+
+        that's why a hand-made stringification is needed.
+        '''
+        if username:
+            self.username = username
+        if password:
+            self.password = password
+        if self.username == None or self.password == None:
+            raise ValueError("No authentication credentials provided")
+
+        payload = '''{ "user" : "%s", "pass" : "%s"}''' % (self.username, self.password)
+        request = '{"jsonrpc": "2.0", "params": %s, "id": 0, "method": "auth"}' % payload
+
+        response = self._run_request(request)
+        jsonrpclib.jsonrpc.check_for_errors(response)
+
+        try:
+            self.transport.session = response['result']['session']
+            # self.level = response['result']['level']
+        except:
+            raise ValueError("Authentication failure")
+
+        if VERBOSE:
+            print("\n# user: %s\n# authenticated session id %s\n" % 
+                    (self.username, self.transport.session))
+
+    def deauthenticate(self):
+        '''
+        sign out
+        '''
+        self.deauth(self.transport.session)
+        self.transport.session = None
+        if VERBOSE:
+            print("\n# deauthenticated session id %s\n" % self.transport.session)
+
+
+
+class mailctl(object):
+    '''
+    class for meta methods - could also be merged with MBApi
+    '''
+
+    server = None
+
+    def __init__(self, username = None, password = None, insecure=False):
+        self.server = MBApi(insecure=insecure)
+        self.server.authenticate(username, password)
+
+    def listContext(self, accountname):
+        '''
+        quick and dirty dump of some information about that account
+        '''
+        contextlist = self.server.context.list( account = accountname)
+        print("# Context-IDs: %s" % contextlist)
+
+        domainlist = self.server.context.list( account = accountname)
+        mailaccounts = 0
+        for contextid in domainlist:
+            print("# Context: %s - Domains: %s" % (contextid, 
+                domainlist[contextid]))
+            for domain in domainlist[contextid]:
+                print("# Email Addresses in domain %s" % domain)
+                for mail in self.server.mail.list( domain = domain ):
+                    print("%s: %s" % (mail['type'], mail['mail']))
+                    mailaccounts += 1
+        print("# total number of mail addresses %s" % mailaccounts)
+
+
+    def add(self, data):
+        '''
+        add mail addresses to the account
+
+        depending on the data these will become inboxes or aliases
+
+        remember: combination of first name and last name must be uniq
+        '''
+
+        existing = 0
+        added = 0
+        for mail in data.mailboxes.keys() + data.aliases.keys():
+            r = None
+            try:
+                r = self.server.mail.get( mail = mail )
+            except:
+                try:
+                    if mail in data.mailboxes.keys():
+                        print("# adding mailbox '%s' " % mail)
+                        r = self.server.mail.add(
+                                mail = mail,
+                                password = data.mailboxes[mail]['password'],
+                                plan = data.mailboxes[mail]['plan'],
+                                first_name = data.mailboxes[mail]['first_name'],
+                                last_name = data.mailboxes[mail]['last_name'],
+                                inboxsave = True,
+                                forwards = {})
+                    elif mail in data.aliases.keys():
+                        print("# adding alias '%s' " % mail)
+                        try:
+                            alias_parts = mail.split('@')
+                            assert(len(alias_parts) == 2)
+                        except:
+                            raise ValueError("Not a valid alias address: %s" % mail)
+
+                        r = self.server.mail.add(
+                                mail = mail,
+                                password = password_generator(size=20),
+                                plan = 'MAIL',
+                                first_name = alias_parts[0],
+                                last_name = alias_parts[1],
+                                inboxsave = False,
+                                forwards = data.aliases[mail]['forwards'])
+                    else:
+                        print("# unknown '%s' :" % mail)
+                except:
+                    print("# %s failed -> %s" % (mail, r))
+                    continue
+                else:
+                    added += 1
+            else:
+                existing += 1
+                continue
+            finally:
+                print("# stats: %s existing %s added" % (existing, added))
+
+
+    def setpasswords(self, d):
+        '''
+        method for changing the password for a mail address
+        '''
+
+        for mail in d.mailboxes.keys():
+            r = None
+            try:
+                r = self.server.mail.set(
+                        mail = mail,
+                        password = d.mailboxes[mail]['password'])
+            except:
+                print("> failure on address %s" % mail)
+            finally:
+                print("# response: %s" % r)
+
+
+    def lookup(self, mail):
+        '''
+        lookup mail address of an account
+        '''
+
+        try:
+            r = self.server.mail.get( mail = mail )
+            print(" - > %s" % r)
+        except:
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.server.transport.session:
+            self.server.deauthenticate()
+
+
+    def __del__(self):
+        if self.server.transport.session:
+            self.server.deauthenticate()
+
+    def setpackage(self, mail, plan):
+        '''
+        set mail package of specified mail address
+        '''
+
+        r = None
+        try:
+           r = self.server.mail.set(
+                   mail = mail,
+                   plan = plan)
+        except:
+            print("> failure on address %s" % mail)
+        finally:
+            print("# response: %s" % r)
+
+
+
+
+class Data(object):
+    '''
+    data object for parsing and storing values of semi-colon separated files
+    '''
+
+    passwordfile = 'mailctl.passwords'
+    mailboxes = {}
+    aliases = {}
+
+    # password_chars = string.ascii_letters + string.digits + '!#$%&()*+-./:=?_~|'
+
+    def __init__(self, files):
+        '''
+        parse the file deciding on the amount of semi-colons what type it has
+        '''
+        for csv in files:
+            with open(csv, 'r') as f:
+                for line in f:
+                    fields = line.split(';')
+                    if len(fields) == 2:
+                        # from;to
+                        if '@' in fields[0]:
+                            aliases = fields[1].translate(None, ' \n').split(',')
+                            self.aliases[fields[0]] = { 'forwards' : aliases }
+                        elif VERBOSE:
+                            print("# mail aliases provided %s" % csv)
+                            print("# %s" % line)
+                    elif len(fields) == 4:
+                        # email;tarif;first_name;last_name
+                        if '@' in fields[0]:
+                            self.mailboxes[fields[0].strip()] = {
+                                  'plan'       : fields[1].strip(),
+                                  'first_name' : fields[2].strip(),
+                                  'last_name'  : fields[3].strip() }
+                        elif VERBOSE:
+                            print("# mail addresses provided %s" % csv)
+                            print("# %s" % line)
+                    else:
+                        print("# unknown file data %s" % csv)
+                        break
+
+        print("# %s mailboxes and %s aliases found" 
+                % (len(self.mailboxes), len(self.aliases)))
+
+
+    def validate(self):
+        '''
+        validate results:
+        - check for double address definitions
+        - check for invalid billing plans
+        - verify that each account has a password given
+        '''
+
+        # intersection = set(mailboxes.keys()).intersection(set(aliases))
+        intersection = set(self.mailboxes.keys()) & set(self.aliases.keys())
+        if intersection:
+            print("# double defined entries: %s" % intersection)
+
+        invalidplan = [ mb for mb in self.mailboxes.keys() 
+                if self.mailboxes[mb]['plan'] not in MBO_PLANS ]
+
+        for ip in invalidplan:
+            print("# mailbox %s has invalid plan %s" 
+                    % (ip, self.mailboxes[ip]['plan']))
+
+        for m in self.mailboxes:
+            if not self.mailboxes[m].has_key('password'):
+                print("# mail %s is missing a passowrd" % m)
+
+
+
+    def give_passwords(self):
+        '''
+        set random passwords for each address
+        '''
+
+        with open(self.passwordfile, 'a') as f:
+            for mb in self.mailboxes.keys():
+                self.mailboxes[mb]['password'] = password_generator()
+
+                f.write('%s;%s\n' % (mb, self.mailboxes[mb]['password']))
+        print('# passwords written to %s' % self.passwordfile)
+
+
+    def load_passwords(self):
+        '''
+        load passwords from a password file
+        '''
+
+        with open(self.passwordfile, 'r') as f:
+            for line in f:
+                m, p = line.split(';')
+                if m in self.mailboxes:
+                    self.mailboxes[m]['password'] = p.translate(None, '\n')
+        print('# passwords loaded from %s' % self.passwordfile)
+
+
+    def passwords(self):
+        '''
+        if mail addresses do not have passwords generate them
+        '''
+
+        try:
+            self.load_passwords()
+        except:
+            self.give_passwords()
+
+
+    def dump(self):
+        '''
+        dump the parsed data structure
+        '''
+
+        for mail in self.mailboxes.keys():
+            print("%s : %s" % (mail, self.mailboxes[mail]['password']))
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    
+    # start with loading credentials from a password file
+    passwordfile = '~/.config/mailctl'
+    config = {}
+    try:
+        import os
+        execfile(os.path.expanduser(passwordfile), config)
+    except:
+        print('''\n> no passwordfile '%s' found - this won't work\n'''
+        '''> passwordfile will be parsed as python code and should define\n'''
+        '''> two variables username and password i.e.\n'''
+        '''> username = 'xxxxxxx'\n'''
+        '''> password = '*******'\n''' % passwordfile)
+        exit(1)
+
+    # parse command-line arguments
+    import argparse
+    parser = argparse.ArgumentParser(description='Handle api.mailbox.org')
+    parser.add_argument('--insecure', action='store_true')
+    parser.add_argument('--verbose', action='store_true')
+    parser.add_argument('--debug', action='store_true')
+    actionparser = parser.add_mutually_exclusive_group()
+    actionparser.add_argument('--account', help='show information about mailbox.org account')
+    actionparser.add_argument('--add', nargs='+',
+            help='a semi-colon separated file of addresses to add',
+            type=file)
+    actionparser.add_argument('--lookup', help='find information of mail address')
+    actionparser.add_argument('--dump', nargs='+',
+            help='dump mail addresses and passwords of semi-colon separated files')
+    actionparser.add_argument('--setpasswords', nargs='+',
+            help='set passwords of mail addresses from password file',
+            type=file)
+    actionparser.add_argument('--setpackage', nargs=2,
+            help='set package of mail address from one of %s' % str(MBO_PLANS),
+            metavar=('PACKAGE', 'EMAILADDRESS'))
+    args = parser.parse_args()
+
+    if args.verbose:
+        VERBOSE=True
+    if args.debug:
+        DEBUG=True
+
+    # check if only the parsed data should be dumped
+    if args.dump:
+        d = Data(args.dump)
+        d.passwords()
+        d.validate()
+        d.dump()
+        exit(0)
+
+    if not ( args.account or args.add or args.lookup or 
+            args.setpasswords or args.setpackage):
+        parser.print_help()
+        exit(1)
+
+    # do something with the api
+    with mailctl(config.get('username'), config.get('password'), args.insecure) as ctl:
+        if args.lookup:
+            ctl.lookup(args.lookup)
+        elif args.setpackage:
+            if not args.setpackage[0] in MBO_PLANS:
+                print("Unknown billing plan %s" % args.setpackage[0])
+                exit(1)
+            ctl.setpackage(args.setpackage[1], args.setpackage[0])
+        elif args.add:
+            d = Data(args.add)
+            d.passwords()
+            d.validate()
+            ctl.add(d)
+        elif args.setpasswords:
+            d = Data(args.setpasswords)
+            d.passwords()
+            d.validate()
+            ctl.setpasswords(d)
+        elif args.account:
+            ctl.listContext(args.account)
+        else:
+            print("> authentication successful - don't know what to do")
+            parser.print_help()
+            exit(1)
+
+
+
+
+
+
+
+
+# vim: tw=78 fo=w2tqc ts=4 ft=python shiftwidth=4 expandtab

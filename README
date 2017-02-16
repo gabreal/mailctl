@@ -1,0 +1,10 @@
+
+mailctl - Manage mail accounts via api.mailbox.org
+
+Send API requests via jsonrpclib to https://api.mailbox.org/v1/ for 
+account management. Invoke mailctl --help for feature list.
+
+
+Dependencies:
+- Python >= 2.7
+- python-jsonrpclib
